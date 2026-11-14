@@ -13,7 +13,7 @@ It needs a blank long enough for the monitor to go into standby. On the monitor 
 Some monitors answer with a different, smaller EDID while they are in standby. Awake, the monitor here sends three EDID blocks with its full mode list. Asleep, it sends two blocks under a different product name, with nothing above 2560x1440.
 
 1. The screens blank. A little later the monitor goes into standby and signals a hotplug.
-2. The kernel reads the standby EDID and replaces its mode list for that connector. Hyprland keeps the list from when the monitor was plugged in.
+2. The kernel reads the standby EDID and replaces its mode list for that connector. Here the new list has nothing above 2560x1080, which is even less than the standby EDID carries, so the kernel is pruning by more than the EDID alone. Hyprland keeps the list from when the monitor was plugged in.
 3. On wake, Hyprland asks for the configured mode. That mode is no longer in the kernel's list, so the kernel refuses the modeset with `EINVAL`.
 4. Nothing drives the link, so the monitor never wakes and never sends its real EDID. Each side is waiting for the other.
 
@@ -76,6 +76,8 @@ cd hyprland-monitor-wake-fix
 
 That copies the script to `~/.local/bin`, the unit to `~/.config/systemd/user`, and starts the service. Nothing is installed system-wide and nothing runs as root.
 
+The service is tied to `graphical-session.target` and needs `HYPRLAND_INSTANCE_SIGNATURE` and `XDG_RUNTIME_DIR` in the systemd user environment so that `hyprctl` can reach Hyprland. Omarchy and other uwsm sessions provide both. If yours does not, the service will run but never find anything to repair; start the script from your Hyprland autostart instead.
+
 Follow what it does:
 
 ```
@@ -113,7 +115,7 @@ Not tested:
 - Hyprland with a hyprlang (`hyprland.conf`) config. The script uses `hyprctl keyword monitor` there, and that path has not been run.
 - A wake from full suspend. The same refused modeset is the likely cause when a monitor stays black after resume and the connector reads `connected` and `disabled`, but only the screen-blank case has been reproduced.
 
-One more thing to know about the test setup: this monitor is pinned to 60 Hz in the Hyprland config because its preferred 120 Hz mode did not train reliably over the cable in use. That is a separate problem. The fault here is the mode missing from the standby EDID, and it does not depend on the cable.
+One more thing to know about the test setup: this monitor is pinned to 60 Hz in the Hyprland config because its preferred 120 Hz mode did not train reliably over the cable in use. The fault described here happens at 60 Hz, where the link is otherwise stable, but no other cable has been tried.
 
 ## When this will not help
 
