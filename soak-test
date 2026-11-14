@@ -1,0 +1,92 @@
+#!/bin/bash
+# Blank and wake the screens over and over, and record how each wake went.
+#
+# The fault this repo repairs shows up on most wakes from standby. The one it
+# cannot repair, a monitor that drops off the bus and never returns, has been
+# seen once. This is how to go looking for it: each cycle blanks the screens,
+# waits for the external monitor to reach standby, wakes them, and writes down
+# whether the monitor woke by itself, was repaired, was rescued by the root
+# helper, or was lost. It stops at the first monitor it cannot get back, since
+# that one needs its cable replugged.
+#
+# The service must be running. Both screens are unusable while this runs.
+#
+# Usage: soak-test CONNECTOR [CYCLES] [BLANK_SECONDS]
+#        soak-test card1-DP-1 20        20 cycles, waking 5s after standby
+#        soak-test card1-DP-1 3 1800    3 cycles, each blanked for 30 minutes
+
+set -u
+
+connector=/sys/class/drm/${1:?usage: soak-test CONNECTOR [CYCLES] [BLANK_SECONDS]}
+cycles=${2:-10}
+blank=${3:-0}
+unit=hyprland-monitor-wake-fix.service
+log=${XDG_STATE_HOME:-$HOME/.local/state}/hyprland-monitor-wake-fix-soak.log
+
+[[ -r $connector/status ]] || { echo "no such connector: $1" >&2; exit 1; }
+systemctl --user is-active -q "$unit" || { echo "$unit is not running" >&2; exit 1; }
+mkdir -p "${log%/*}"
+
+note() { printf '%s %s\n' "$(date '+%F %T')" "$*" | tee -a "$log"; }
+lit() { [[ $(<"$connector/status") == connected && $(<"$connector/enabled") == enabled ]]; }
+blank_screens() { hyprctl dispatch 'hl.dsp.dpms({ action = "disable" })' >/dev/null 2>&1; }
+wake_screens() { hyprctl dispatch 'hl.dsp.dpms({ action = "enable" })' >/dev/null 2>&1; }
+said() { journalctl --user -u "$unit" --since "$since" --no-pager -o cat | grep -q -- "$1"; }
+
+trap 'wake_screens' EXIT
+
+awake_modes=$(wc -l <"$connector/modes")
+note "soak start: $cycles cycles on $1, blank ${blank}s, $awake_modes modes awake"
+
+declare -A tally=()
+for ((cycle = 1; cycle <= cycles; cycle++)); do
+  if ! lit; then
+    note "cycle $cycle: monitor is not lit before the blank, stopping"
+    break
+  fi
+
+  since=$(date '+%F %T')
+  blank_screens
+
+  # Standby shows as a changed mode list, or as the monitor leaving the bus.
+  for ((waited = 0; waited < 120; waited++)); do
+    [[ $(wc -l <"$connector/modes") != "$awake_modes" || $(<"$connector/status") != connected ]] && break
+    sleep 1
+  done
+  standby="standby after ${waited}s ($(wc -l <"$connector/modes") modes, $(<"$connector/status"))"
+  ((waited >= 120)) && standby="no standby in 120s"
+
+  if ((blank > waited)); then sleep $((blank - waited)); else sleep 5; fi
+  wake_screens
+
+  # Long enough for the wake, the repair, the 45s wait for a lost monitor and
+  # the helper's 20s.
+  outcome=""
+  for ((waited = 0, held = 0; waited < 150; waited++)); do
+    if lit; then ((held++)); else held=0; fi
+    if said "did not bring it back" || said "replug the cable"; then outcome=lost; break; fi
+    if ((held >= 10)); then
+      if said "back after the detect"; then outcome=rescued
+      elif said "woke, configured mode restored"; then outcome=repaired
+      elif said "stuck after wake"; then held=0; sleep 1; continue
+      else outcome=woke-unaided; fi
+      break
+    fi
+    sleep 1
+  done
+  [[ -n $outcome ]] || outcome=dark-unexplained
+
+  tally[$outcome]=$((${tally[$outcome]:-0} + 1))
+  note "cycle $cycle: $outcome, ${waited}s after wake; $standby; now $(<"$connector/status") $(<"$connector/enabled")"
+  journalctl --user -u "$unit" --since "$since" --no-pager -o cat | sed 's/^/    /' >>"$log"
+
+  if [[ $outcome == lost || $outcome == dark-unexplained ]]; then
+    note "stopping: the monitor did not come back"
+    break
+  fi
+  sleep 10
+done
+
+summary=""
+for outcome in "${!tally[@]}"; do summary+=" $outcome=${tally[$outcome]}"; done
+note "soak end:$summary"

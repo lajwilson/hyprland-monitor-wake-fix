@@ -20,7 +20,12 @@ set -u
 POLL=2        # seconds between checks
 SETTLE=4      # seconds a monitor must stay stuck before anything is done
 TRIES=3       # repair attempts per stuck episode
+RETURN=45     # seconds a woken monitor gets to come back onto the bus
 DRM=${MONITOR_WAKE_FIX_DRM_PATH:-/sys/class/drm}
+HOLD=5        # seconds the picture must hold before the wake counts
+TYPEC=${MONITOR_WAKE_FIX_TYPEC_PATH:-/sys/class/typec}
+ALTMODES=${MONITOR_WAKE_FIX_ALTMODE_PATH:-/sys/bus/typec/devices}
+HELPER=${MONITOR_WAKE_FIX_HELPER:-/usr/local/libexec/hyprland-monitor-wake-fix-detect}
 
 log() { printf '%s\n' "$*"; }
 
@@ -40,6 +45,65 @@ dark() { [[ $(<"$1/status") == connected && $(<"$1/enabled") == disabled ]]; }
 # has dropped off the bus to come back announcing its real modes. The first can
 # last well under a second before the second, so both count.
 woke() { [[ $(<"$1/enabled") == enabled || $(<"$1/status") != connected ]]; }
+
+# The monitor is on the bus and the kernel is driving it.
+lit() { [[ $(<"$1/status") == connected && $(<"$1/enabled") == enabled ]]; }
+
+# What the USB-C ports see when a monitor has gone missing. A port with no
+# partner means the monitor let go of the cable itself. A partner that is still
+# there means only the display signal went, and the kernel missed or never got
+# the monitor's return.
+lost_report() {
+  local port alt found=0
+  for port in "$TYPEC"/port*; do
+    [[ $port =~ /port[0-9]+$ ]] || continue
+    found=1
+    if [[ -e $port-partner ]]; then
+      log "  ${port##*/}: partner present"
+    else
+      log "  ${port##*/}: no partner"
+    fi
+    # Alternate modes of the port and of its partner. svid ff01 is DisplayPort.
+    for alt in "$ALTMODES/${port##*/}".* "$ALTMODES/${port##*/}-partner".*; do
+      [[ -r $alt/svid ]] || continue
+      log "    ${alt##*/}: svid $(<"$alt/svid") active $(cat "$alt/active" 2>/dev/null)"
+    done
+  done
+  ((found)) || log "  no USB-C ports to report on"
+}
+
+# Wait up to $2 seconds for a picture that holds for HOLD seconds. A waking
+# monitor is driven for a moment before it drops off the bus, so one glimpse of
+# it lit proves nothing.
+holds() {
+  local waited
+  for ((waited = 0, held = 0; waited < $2 + HOLD && held < HOLD; waited++)); do
+    if lit "$1"; then ((held++)); else held=0; fi
+    sleep 1
+  done
+  ((held >= HOLD))
+}
+
+# A monitor that is gone from the bus cannot be modeset back. With the optional
+# root helper installed, have the kernel look at the connector again, which
+# finds a monitor whose return it missed. Without it, replugging is all there is.
+rescue() {
+  local connector=$1 name=$2 line
+  if [[ ! -x $HELPER ]]; then
+    log "$name: replug the cable to bring it back (the root helper that could retry is not installed)"
+    return 1
+  fi
+  log "$name: asking the kernel to detect it again"
+  while IFS= read -r line; do
+    log "  $line"
+  done < <(sudo -n "$HELPER" "${connector##*/}" 2>&1)
+  if holds "$connector" 20; then
+    log "$name: back after the detect"
+    return 0
+  fi
+  log "$name: the detect did not bring it back, replug the cable"
+  return 1
+}
 
 # The size Hyprland is trying to show on a monitor right now, as WIDTHxHEIGHT.
 # Empty when the monitor is blanked by DPMS, turned off in the config, or has
@@ -103,7 +167,7 @@ restore_config() {
 }
 
 repair() {
-  local connector=$1 name=$2 mode asleep_modes awake_modes waited
+  local connector=$1 name=$2 mode asleep_modes awake_modes waited held
 
   # The name goes into a Hyprland command, so take nothing but a kernel
   # connector name.
@@ -140,8 +204,20 @@ repair() {
   done
 
   restore_config
-  sleep 3
-  log "$name: woke, configured mode restored"
+
+  # Dropping off the bus is only half a wake. The monitor has to come back and
+  # be driven before this counts, and the ones that return do so in seconds.
+  if holds "$connector" "$RETURN"; then
+    log "$name: woke, configured mode restored"
+    return 0
+  fi
+  if [[ $(<"$connector/status") != connected ]]; then
+    log "$name: dropped off the bus while waking and did not come back in ${RETURN}s"
+    lost_report
+    return 2
+  fi
+  log "$name: came back but is still not driven"
+  return 1
 }
 
 check() {
@@ -155,7 +231,18 @@ check() {
     sleep "$SETTLE"
     for ((try = 1; try <= TRIES; try++)); do
       stuck "$connector" "$name" || break
-      repair "$connector" "$name" && break
+      repair "$connector" "$name"
+      case $? in
+        0) break ;;
+        # Gone from the bus: there is nothing left to modeset. Hyprland picks
+        # the monitor up by itself once it is detected or plugged back in.
+        # A rescue that leaves it connected but dark is back to being stuck,
+        # which the next try can repair.
+        2)
+          rescue "$connector" "$name" && break
+          [[ $(<"$connector/status") == connected ]] || break
+          ;;
+      esac
       sleep $((try * 5))
     done
 

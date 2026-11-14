@@ -1,0 +1,26 @@
+#!/bin/bash
+# Optional root helper for hyprland-monitor-wake-fix.
+#
+# A monitor that dropped off the bus while waking and never came back is
+# something no user can repair: only root may ask the kernel to look at a
+# connector again. This asks, and when the kernel finds the monitor it sends
+# the hotplug event itself, which is what makes Hyprland light it. It does
+# nothing else, and it takes nothing from its caller but a connector name.
+#
+# Usage: hyprland-monitor-wake-fix-detect card1-DP-1
+
+PATH=/usr/bin:/bin
+set -u
+
+[[ $# -eq 1 && $1 =~ ^card[0-9]+-[A-Za-z0-9-]+$ ]] || { echo "usage: $0 cardN-CONNECTOR" >&2; exit 64; }
+[[ $1 =~ -(eDP|LVDS|DSI)- ]] && { echo "$1 is a built-in panel" >&2; exit 64; }
+
+drm=${MONITOR_WAKE_FIX_DETECT_ROOT:-/sys/class/drm}
+((EUID == 0)) && drm=/sys/class/drm   # the override is for tests, never for root
+connector=$drm/$1
+[[ -w $connector/status ]] || { echo "$1: no such connector, or not root" >&2; exit 66; }
+
+echo "before: $(<"$connector/status")"
+echo detect >"$connector/status"
+sleep 1
+echo "after: $(<"$connector/status")"
