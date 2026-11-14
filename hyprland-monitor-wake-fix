@@ -1,0 +1,179 @@
+#!/bin/bash
+# Bring back an external monitor that stays black after the screens wake.
+#
+# Some monitors answer with a smaller standby EDID while they sleep. The kernel
+# takes the new mode list, Hyprland keeps the one from when the monitor was
+# plugged in, and on wake the kernel refuses the mode Hyprland asks for. Nothing
+# drives the link, so the monitor never wakes. Blanking and waking again repeats
+# the refused modeset, and so does a config reload. Pulling the cable was the
+# only way out.
+#
+# The fix needs no root: ask for a small mode the sleeping monitor does offer.
+# The kernel accepts it, the link trains, the monitor wakes and announces its
+# real modes, and a config reload then puts your own monitor settings back.
+#
+# Usage: hyprland-monitor-wake-fix           watch and repair (run as a user service)
+#        hyprland-monitor-wake-fix --once    check once, repair if stuck, then exit
+
+set -u
+
+POLL=2        # seconds between checks
+SETTLE=4      # seconds a monitor must stay stuck before anything is done
+TRIES=3       # repair attempts per stuck episode
+DRM=${MONITOR_WAKE_FIX_DRM_PATH:-/sys/class/drm}
+
+log() { printf '%s\n' "$*"; }
+
+# Kernel connector directories for every external output.
+externals() {
+  local connector
+  for connector in "$DRM"/card*-*; do
+    [[ $connector =~ -(eDP|LVDS|DSI)-[^/]+$ ]] && continue
+    [[ -r $connector/status && -r $connector/enabled ]] && printf '%s\n' "$connector"
+  done
+}
+
+# The kernel sees a monitor but is not driving it.
+dark() { [[ $(<"$1/status") == connected && $(<"$1/enabled") == disabled ]]; }
+
+# A monitor shows it woke in one of two ways: the kernel is driving it, or it
+# has dropped off the bus to come back announcing its real modes. The first can
+# last well under a second before the second, so both count.
+woke() { [[ $(<"$1/enabled") == enabled || $(<"$1/status") != connected ]]; }
+
+# The size Hyprland is trying to show on a monitor right now, as WIDTHxHEIGHT.
+# Empty when the monitor is blanked by DPMS, turned off in the config, or has
+# no mode at all.
+wanted_size() {
+  hyprctl -j monitors all 2>/dev/null |
+    jq -r --arg name "$1" \
+      '.[] | select(.name == $name and .dpmsStatus == true and .disabled == false and .width > 0 and .height > 0) | "\(.width)x\(.height)"' \
+      2>/dev/null | head -n1
+}
+
+# Hyprland wants a picture at a size the kernel no longer lists for the
+# connector. A size the kernel still lists was refused for some other reason,
+# such as a link that will not train or a monitor switched off at its own
+# button. Another modeset does not help there, so those are left alone.
+stuck() {
+  local size
+  dark "$1" || return 1
+  size=$(wanted_size "$2")
+  [[ -n $size ]] || return 1
+  ! grep -qx -- "$size" "$1/modes" 2>/dev/null
+}
+
+# Sizes nearly every monitor offers awake and asleep, largest first. The mode
+# has to be in the kernel's list for the kernel to accept it and in Hyprland's
+# older list for Hyprland to ask for it.
+fallback_mode() {
+  local size
+  for size in 1920x1080 1280x720 1024x768 800x600 640x480; do
+    if grep -qx "$size" "$1/modes" 2>/dev/null; then
+      printf '%s@60\n' "$size"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Hyprland takes monitor rules as Lua when it runs a Lua config and as a
+# keyword when it runs a hyprlang one.
+set_mode() {
+  local provider
+  provider=$(hyprctl -j status 2>/dev/null | jq -r '.configProvider // empty' 2>/dev/null)
+  if [[ $provider == lua ]]; then
+    hyprctl eval "hl.monitor({ output = \"$1\", mode = \"$2\", position = \"auto\", scale = 1 })"
+  else
+    hyprctl keyword monitor "$1,$2,auto,1"
+  fi >/dev/null 2>&1
+}
+
+# The small mode is a runtime monitor rule that outlives the attempt, so every
+# attempt ends here, whether or not the monitor woke. Left behind, it would
+# bring the monitor up small the next time it was plugged in.
+restore_config() {
+  # Omarchy pauses reloads while a package update is replacing config files.
+  if command -v omarchy-hyprland-reload-guard >/dev/null; then
+    while omarchy-hyprland-reload-guard paused; do
+      sleep 2
+    done
+  fi
+  hyprctl reload >/dev/null 2>&1
+}
+
+repair() {
+  local connector=$1 name=$2 mode asleep_modes awake_modes waited
+
+  # The name goes into a Hyprland command, so take nothing but a kernel
+  # connector name.
+  [[ $name =~ ^[A-Za-z0-9-]+$ ]] || return 1
+
+  if ! mode=$(fallback_mode "$connector"); then
+    log "$name: stuck after wake and offers no mode to wake it with"
+    return 1
+  fi
+
+  asleep_modes=$(<"$connector/modes")
+  log "$name: stuck after wake, waking its link at $mode"
+  set_mode "$name" "$mode"
+
+  for ((waited = 0; waited < 75; waited++)); do
+    woke "$connector" && break
+    sleep 0.2
+  done
+  if ! woke "$connector"; then
+    log "$name: did not take $mode"
+    restore_config
+    return 1
+  fi
+
+  # Reloading while the monitor still shows its sleeping modes would ask for
+  # the configured one too early and get it refused again. Once it has dropped
+  # off the bus the reload can go ahead, so that it comes back straight into
+  # the configured mode.
+  for ((waited = 0; waited < 10; waited++)); do
+    [[ $(<"$connector/status") != connected ]] && break
+    awake_modes=$(<"$connector/modes")
+    [[ -n $awake_modes && $awake_modes != "$asleep_modes" ]] && break
+    sleep 1
+  done
+
+  restore_config
+  sleep 3
+  log "$name: woke, configured mode restored"
+}
+
+check() {
+  local connector name try
+  for connector in $(externals); do
+    name=${connector##*/}
+    name=${name#card*-}
+    stuck "$connector" "$name" || continue
+
+    # A wake that is still being modeset looks the same for a moment.
+    sleep "$SETTLE"
+    for ((try = 1; try <= TRIES; try++)); do
+      stuck "$connector" "$name" || break
+      repair "$connector" "$name" && break
+      sleep $((try * 5))
+    done
+
+    # A monitor these tries could not bring back is left dark with its config
+    # restored. Wait until it is blanked, unplugged or lit before trying again.
+    if stuck "$connector" "$name"; then
+      log "$name: still stuck after $TRIES tries, leaving it until something changes"
+      while stuck "$connector" "$name"; do sleep 10; done
+    fi
+  done
+}
+
+if [[ ${1:-} == --once ]]; then
+  check
+  exit 0
+fi
+
+log "watching external monitors"
+while sleep "$POLL"; do
+  check
+done

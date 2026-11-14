@@ -1,0 +1,13 @@
+[Unit]
+Description=Bring back an external monitor that stays black after the screens wake
+Documentation=https://github.com/lajwilson/hyprland-monitor-wake-fix
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/hyprland-monitor-wake-fix
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
